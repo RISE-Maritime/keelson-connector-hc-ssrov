@@ -89,7 +89,7 @@ def publish_data(
     publisher.put(value)
 
 
-def enclose_from_int(value: int, timestamp_ns: int = None) -> bytes:
+def enclose_from_int(value: int, timestamp_ns: int | None = None) -> bytes:
     """Create an enclosed TimestampedInt message."""
     if timestamp_ns is None:
         timestamp_ns = time.time_ns()
