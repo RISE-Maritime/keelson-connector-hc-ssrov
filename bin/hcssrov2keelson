@@ -14,8 +14,11 @@ Publishes to Keelson subjects:
 - joystick_y (TimestampedInt) - Y axis value (-32768 to 32767)
 - joystick_rz (TimestampedInt) - Rotation Z axis value (-32768 to 32767)
 - joystick_z (TimestampedInt) - Z axis/throttle value (-32768 to 32767)
-- button_pressed (TimestampedInt) - Button number when pressed (0-based)
-- button_released (TimestampedInt) - Button number when released (0-based)
+- {function_name} (TimestampedInt) - 1 when pressed, 0 when released for mapped buttons
+  e.g. arm, disarm, mount_tilt_up, lights1_brighter, shift, mode_manual, ...
+  Shift + button publishes to alternate subject e.g. trim_roll_inc, input_hold_set, ...
+- button_pressed (TimestampedInt) - Button number for unmapped buttons when pressed
+- button_released (TimestampedInt) - Button number for unmapped buttons when released
 """
 
 import sys
@@ -37,6 +40,7 @@ from terminal_inputs import terminal_inputs
 # Global state
 PUBLISHERS: Dict[tuple, Any] = {}  # Cache for lazy publisher creation
 shutdown_requested = False  # Flag for graceful shutdown
+shift_active = False  # Tracks whether the Shift modifier button is held
 
 # Joystick event format (from linux/joystick.h)
 JS_EVENT_BUTTON = 0x01  # Button pressed/released
@@ -48,8 +52,46 @@ AXIS_MAP = {
     0: 'joystick_x',   # X axis
     1: 'joystick_y',   # Y axis
     2: 'joystick_z',   # Z axis (throttle)
-    5: 'joystick_rz',  # Rz axis (rotation)
+    3: 'joystick_rz',  # Rz axis (rotation/twist)
 }
+
+# Primary button function mapping (0-indexed Linux joystick button numbers)
+# Physical button N (1-indexed from manual) = Linux button N-1 (0-indexed)
+BUTTON_MAP = {
+    0:  'servo_3_min_momentary',  # Button 1: Open Gripper
+    1:  'servo_3_max_momentary',  # Button 2: Close Gripper
+    2:  'lights1_brighter',       # Button 3 (CCW): Lights Brighter
+    3:  'lights1_dimmer',         # Button 4 (CW): Lights Dimmer
+    4:  'gain_inc',               # Button 5 (CCW): Increase Gain
+    5:  'gain_dec',               # Button 6 (CW): Decrease Gain
+    6:  'mount_tilt_up',          # Button 7: Camera Tilt Up
+    7:  'mount_tilt_down',        # Button 8: Camera Tilt Down
+    8:  'shift',                  # Button 9: Shift modifier
+    9:  'mode_manual',            # Button 10: Manual Flight Mode
+    10: 'mode_stabilize',         # Button 11: Stabilize Flight Mode
+    11: 'mode_depth_hold',        # Button 12: Depth Hold Flight Mode
+    12: 'mode_poshold',           # Button 13: Position Hold Flight Mode
+    13: 'arm',                    # Button 14: Arm ROV
+    14: 'disarm',                 # Button 15: Disarm ROV
+    15: 'a',                      # Button 16: User-defined
+    16: 'b',                      # Button 17: User-defined
+    17: 'joystick_top_left',      # Button 18: User-defined
+    18: 'joystick_top_right',     # Button 19: User-defined
+    
+    # Buttons 16-18 are user-defined, no default mapping
+}
+
+# Alternate (Shift + button) function mapping for dual-function buttons
+BUTTON_SHIFT_MAP = {
+    0: 'input_hold_set',          # Button 1 + Shift: Toggle Input Hold
+    1: 'roll_pitch_toggle',       # Button 2 + Shift: Toggle Roll and Pitch
+    2: 'trim_roll_inc',           # Button 3 + Shift (CCW): Trim Roll Right
+    3: 'trim_roll_dec',           # Button 4 + Shift (CW): Trim Roll Left
+    4: 'trim_pitch_inc',          # Button 5 + Shift (CCW): Trim Pitch Forward
+    5: 'trim_pitch_dec',          # Button 6 + Shift (CW): Trim Pitch Backward
+}
+
+SHIFT_BUTTON = 8  # 0-indexed button number of the Shift modifier
 
 logger = logging.getLogger("hcssrov2keelson")
 
@@ -144,29 +186,31 @@ def handle_joystick_event(timestamp, value, event_type, number, session, args):
     event_type = event_type & ~JS_EVENT_INIT
     
     if event_type == JS_EVENT_BUTTON:
-        # Button event
-        if value == 1:
-            # Button pressed
-            logger.info(f"Button {number} pressed")
-            publish_data(
-                session,
-                args.realm,
-                args.entity_id,
-                "button_pressed",
-                enclose_from_int(number, timestamp_ns),
-                args.source_id,
-            )
+        global shift_active
+        pressed = value == 1
+
+        if number == SHIFT_BUTTON:
+            shift_active = pressed
+            subject = 'shift'
+        elif shift_active and number in BUTTON_SHIFT_MAP:
+            subject = BUTTON_SHIFT_MAP[number]
+        elif number in BUTTON_MAP:
+            subject = BUTTON_MAP[number]
         else:
-            # Button released
-            logger.debug(f"Button {number} released")
+            # Unmapped button: fallback to generic subjects with button number as value
+            subject = 'button_pressed' if pressed else 'button_released'
+            logger.info(f"Button {number} (unmapped) {'pressed' if pressed else 'released'}")
             publish_data(
-                session,
-                args.realm,
-                args.entity_id,
-                "button_released",
-                enclose_from_int(number, timestamp_ns),
-                args.source_id,
+                session, args.realm, args.entity_id, subject,
+                enclose_from_int(number, timestamp_ns), args.source_id,
             )
+            return
+
+        logger.info(f"Button {number} ({subject}) {'pressed' if pressed else 'released'}")
+        publish_data(
+            session, args.realm, args.entity_id, subject,
+            enclose_from_int(int(pressed), timestamp_ns), args.source_id,
+        )
     
     elif event_type == JS_EVENT_AXIS:
         # Axis event - check if it's one we care about
@@ -237,7 +281,8 @@ def main():
         logger.info(f"Connected to realm: {args.realm}, entity: {args.entity_id}")
         logger.info(f"Publishing with source_id: {args.source_id}")
         logger.info(f"Reading controller events from {args.device}...")
-        logger.info("Subjects: joystick_x, joystick_y, joystick_rz, joystick_z, button_pressed, button_released")
+        button_subjects = ', '.join(sorted(set(BUTTON_MAP.values()) | set(BUTTON_SHIFT_MAP.values())))
+        logger.info(f"Subjects: joystick_x, joystick_y, joystick_rz, joystick_z, {button_subjects}")
 
         event_count = 0
         

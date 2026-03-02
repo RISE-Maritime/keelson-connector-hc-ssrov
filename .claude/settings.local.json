@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip show keelson)",
+      "Bash(python3 -c \"import keelson; print\\(keelson.__file__\\)\")",
+      "Bash(python3:*)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:pypi.org)",
+      "Bash(git clone https://github.com/RISE-Maritime/keelson.git /tmp/keelson-explore)"
+    ]
+  }
+}
