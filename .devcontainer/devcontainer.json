@@ -1,7 +1,7 @@
 // For format details, see https://aka.ms/devcontainer.json. For config options, see the
 // README at: https://github.com/devcontainers/templates/tree/main/src/python
 {
-	"name": "SBG Logger DevContainer",
+	"name": "HC-ROV DevContainer",
 	// Or use a Dockerfile or Docker Compose file. More info: https://containers.dev/guide/dockerfile
 	"image": "mcr.microsoft.com/devcontainers/python:dev-3.14-bookworm",
 	"features": {
@@ -10,8 +10,10 @@
 	"runArgs": [
 		"--network=host",
 		"--privileged",
-		"--name=devcon-hc-ssrov",
-		"--device=/dev/ttyUSB0:/dev/ttyUSB0"
+		"--name=devcon-hc-ssrov"
+		// To pass through devices, add one of these to runArgs when the device is connected:
+		// macOS serial:    "--device=/dev/cu.usbmodemHIDFG1:/dev/ttyACM0"
+		// Linux joystick:  "--device=/dev/input/js0:/dev/input/js0"
 	],
 	// Features to add to the dev container. More info: https://containers.dev/features.
 	// "features": {},
@@ -25,7 +27,10 @@
 			"extensions": [
 				"github.vscode-github-actions",
 				"ms-python.black-formatter",
-				"ms-toolsai.jupyter"
+				"ms-toolsai.jupyter",
+				"Anthropic.claude-code",
+				"streetsidesoftware.code-spell-checker",
+				"ms-azuretools.vscode-docker"
 			]
 		}
 	}
