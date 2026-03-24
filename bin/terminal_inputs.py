@@ -5,9 +5,9 @@ def terminal_inputs():
     """Parse the terminal inputs and return the arguments"""
 
     parser = argparse.ArgumentParser(
-        prog="keelson_connector_hc_ssrov",
+        prog="keelson_connector_hc",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-        description="Read ROV Hand Controller from joystick device and publish to Keelson/Zenoh",
+        description="Read joystick/gamepad controller and publish to Keelson/Zenoh",
     )
 
     parser.add_argument(
@@ -51,19 +51,29 @@ def terminal_inputs():
     )
 
     parser.add_argument(
-        "-s",
-        "--source-id",
-        default="controller/hc",
-        type=str,
-        help="Source id being a unique id representing the source of the data",
-    )
-
-    parser.add_argument(
         "--device",
         "-d",
         type=str,
         default="/dev/input/js0",
         help="Joystick device path (default: /dev/input/js0)",
+    )
+
+    parser.add_argument(
+        "--relay",
+        type=str,
+        default=None,
+        help="TCP relay address (host:port) for cross-platform mode. "
+        "Reads joystick events from a TCP relay instead of a device file. "
+        "Example: --relay host.docker.internal:9090",
+    )
+
+    parser.add_argument(
+        "-c",
+        "--controller",
+        type=str,
+        default="ssrov",
+        choices=["ssrov", "logitech"],
+        help="Controller profile for axis/button mapping",
     )
 
     # Parse arguments and start doing our thing

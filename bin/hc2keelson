@@ -1,0 +1,485 @@
+#!/usr/bin/env python3
+
+"""
+Command line utility for reading joystick/gamepad controllers and publishing to Keelson/Zenoh.
+
+Reads controller data from Linux joystick device (/dev/input/js0) or TCP relay,
+captures axes and button events, and publishes to Keelson subjects on the Zenoh bus.
+
+Supports multiple controller profiles (--controller flag):
+- ssrov: Seascape ROV Hand Controller — ROV-function naming with shift modifier
+- logitech: Logitech F310/F710 — hardware-descriptive naming, no shift logic
+
+Publishes axes and buttons as TimestampedInt messages. Unmapped buttons
+publish to button_pressed/button_released with the button number as value.
+"""
+
+import sys
+import json
+import logging
+import time
+import struct
+import signal
+import socket
+import select
+from datetime import datetime, timezone
+from typing import Dict, Any
+from pathlib import Path
+
+import zenoh
+import keelson
+from keelson.payloads.Primitives_pb2 import TimestampedInt, TimestampedFloat
+
+from terminal_inputs import terminal_inputs
+
+# Global state
+PUBLISHERS: Dict[tuple, Any] = {}  # Cache for lazy publisher creation
+shutdown_requested = False  # Flag for graceful shutdown
+
+# Per-key axis rate limiter: prevents flooding subscribers at >200 Hz
+# Only publishes if value changed significantly OR enough time has elapsed
+_axis_last_published: Dict[str, tuple] = {}  # source_id -> (time_ns, value)
+AXIS_MIN_INTERVAL_NS = 30_000_000  # 30ms = ~33 Hz max per axis
+AXIS_MIN_CHANGE = 0.01  # publish immediately if value changed by more than 1%
+
+
+# Joystick event format (from linux/joystick.h)
+JS_EVENT_BUTTON = 0x01  # Button pressed/released
+JS_EVENT_AXIS = 0x02  # Joystick moved
+JS_EVENT_INIT = 0x80  # Initial state
+
+# Controller profiles: axis/button mappings per controller type
+# Key expression pattern:
+#   {realm}/@v0/{entity_id}/pubsub/{subject}/controller/{hw}/{function}
+# Where hw = controller type (ssrov, logitech) and function = control name
+CONTROLLER_PROFILES = {
+    # Seascape ROV Hand Controller
+    # Physical button N (1-indexed from manual) = Linux button N-1 (0-indexed)
+    "ssrov": {
+        "axis_map": {
+            0: "joystick_x",  # X axis
+            1: "joystick_y",  # Y axis
+            2: "joystick_z",  # Z axis (throttle)
+            3: "joystick_rz",  # Rz axis (rotation/twist)
+        },
+        "button_name_map": {
+            0: "grip_open",  # Button 1: Open Gripper
+            1: "grip_close",  # Button 2: Close Gripper
+            2: "lights_up",  # Button 3 (CCW): Lights Brighter
+            3: "lights_down",  # Button 4 (CW): Lights Dimmer
+            4: "gain_up",  # Button 5 (CCW): Increase Gain
+            5: "gain_down",  # Button 6 (CW): Decrease Gain
+            6: "tilt_up",  # Button 7: Camera Tilt Up
+            7: "tilt_down",  # Button 8: Camera Tilt Down
+            8: "shift",  # Button 9: Shift modifier
+            9: "mode_manual",  # Button 10: Manual Flight Mode
+            10: "mode_stabilize",  # Button 11: Stabilize
+            11: "mode_depth_hold",  # Button 12: Depth Hold
+            12: "mode_poshold",  # Button 13: Position Hold
+            13: "arm",  # Button 14: Arm ROV
+            14: "disarm",  # Button 15: Disarm ROV
+            15: "a",  # Button 16: User-defined
+            16: "b",  # Button 17: User-defined
+            17: "top_left",  # Button 18: User-defined
+            18: "top_right",  # Button 19: User-defined
+        },
+        "button_to_axis": {},
+    },
+    # Logitech F310/F710 Gamepad
+    # DirectInput mode (hardware switch on back set to "D")
+    # Shows as "Logitech Dual Action" — 4 analog axes, 12 buttons, 1 hat
+    # Axes 2-3 are right stick, 4-5 are dpad (hat converted to axis by kernel)
+    "logitech": {
+        "axis_map": {
+            0: "joystick_x",  # Left Stick X
+            1: "joystick_y",  # Left Stick Y
+            2: "joystick_rx",  # Right Stick X
+            3: "joystick_ry",  # Right Stick Y
+            4: "dpad_x",  # D-pad X (hat→axis)
+            5: "dpad_y",  # D-pad Y (hat→axis)
+        },
+        "button_name_map": {
+            0: "x",  # X (left face button)
+            1: "a",  # A (bottom face button)
+            2: "b",  # B (right face button)
+            3: "y",  # Y (top face button)
+            4: "lb",  # Left Bumper
+            5: "rb",  # Right Bumper
+            8: "back",  # Back
+            9: "start",  # Start
+            10: "l3",  # Left Stick Click
+            11: "r3",  # Right Stick Click
+        },
+        # Digital trigger buttons published as axis values (0.0 or 1.0)
+        "button_to_axis": {
+            6: "joystick_lt",  # LT button → axis
+            7: "joystick_rt",  # RT button → axis
+        },
+    },
+}
+
+logger = logging.getLogger("hc2keelson")
+
+
+def signal_handler(signum, frame):
+    """Handle shutdown signals gracefully."""
+    global shutdown_requested
+    logger.info("Shutdown signal received")
+    shutdown_requested = True
+
+
+def get_or_create_publisher(
+    session, realm: str, entity_id: str, subject: str, source_id: str
+):
+    """
+    Get or create a Zenoh publisher for the specified subject.
+
+    Publishers are cached globally to avoid recreating them for repeated publishes.
+    """
+    key = (realm, entity_id, subject, source_id)
+    if key not in PUBLISHERS:
+        key_expr = keelson.construct_pubsub_key(realm, entity_id, subject, source_id)
+        PUBLISHERS[key] = session.declare_publisher(
+            key_expr,
+            congestion_control=zenoh.CongestionControl.DROP,
+            priority=zenoh.Priority.DEFAULT,
+        )
+        logger.debug(f"Created publisher for {key_expr}")
+    return PUBLISHERS[key]
+
+
+def publish_data(
+    session, realm: str, entity_id: str, subject: str, value: bytes, source_id: str
+):
+    """Publish data to a Keelson subject."""
+    publisher = get_or_create_publisher(session, realm, entity_id, subject, source_id)
+    publisher.put(value)
+
+
+def enclose_from_int(value: int, timestamp_ns: int | None = None) -> bytes:
+    """Create an enclosed TimestampedInt message."""
+    if timestamp_ns is None:
+        timestamp_ns = time.time_ns()
+
+    payload = TimestampedInt()
+    payload.timestamp.FromNanoseconds(timestamp_ns)
+    payload.value = value
+    return keelson.enclose(payload.SerializeToString())
+
+
+def enclose_from_float(value: float, timestamp_ns: int | None = None) -> bytes:
+    """Create an enclosed TimestampedFloat message."""
+    if timestamp_ns is None:
+        timestamp_ns = time.time_ns()
+
+    payload = TimestampedFloat()
+    payload.timestamp.FromNanoseconds(timestamp_ns)
+    payload.value = value
+    return keelson.enclose(payload.SerializeToString())
+
+
+def normalize_axis(value: int) -> float:
+    """Normalize int16 axis value to -1.0..1.0 range."""
+    return max(-1.0, min(1.0, value / 32767.0))
+
+
+def read_joystick_event(device_file):
+    """
+    Read a single joystick event from the device.
+
+    Event format (8 bytes):
+        - timestamp (4 bytes, unsigned int)
+        - value (2 bytes, signed short)
+        - type (1 byte, unsigned char)
+        - number (1 byte, unsigned char)
+
+    Returns:
+        tuple: (timestamp, value, event_type, number) or None if no data
+    """
+    try:
+        event_data = device_file.read(8)
+        if len(event_data) < 8:
+            return None
+
+        # Unpack event: timestamp (I), value (h), type (B), number (B)
+        timestamp, value, event_type, number = struct.unpack("IhBB", event_data)
+        return (timestamp, value, event_type, number)
+    except Exception as e:
+        logger.debug(f"Error reading joystick event: {e}")
+        return None
+
+
+def handle_joystick_event(
+    timestamp, value, event_type, number, session, args, profile, source_base
+):
+    """
+    Handle a joystick event and publish to Keelson.
+
+    Source-id pattern: controller/{hw}/{function}
+
+    - Axes publish as TimestampedFloat (normalized -1.0 to 1.0)
+    - Buttons publish as TimestampedInt (1=pressed, 0=released) to subject "button_state_change"
+    - Digital triggers in button_to_axis publish as TimestampedFloat (0.0 or 1.0)
+    """
+    timestamp_ns = time.time_ns()
+    axis_map = profile["axis_map"]
+    button_name_map = profile["button_name_map"]
+    button_to_axis = profile["button_to_axis"]
+
+    # Remove INIT flag to get actual event type
+    event_type = event_type & ~JS_EVENT_INIT
+
+    if event_type == JS_EVENT_BUTTON:
+        pressed = value == 1
+
+        # Digital trigger → publish as axis (0.0 or 1.0)
+        if number in button_to_axis:
+            axis_name = button_to_axis[number]
+            axis_value = 1.0 if pressed else 0.0
+            source_id = f"{source_base}/{axis_name}"
+            logger.info(f"Trigger {number} ({axis_name}): {axis_value}")
+            publish_data(
+                session,
+                args.realm,
+                args.entity_id,
+                axis_name,
+                enclose_from_float(axis_value, timestamp_ns),
+                source_id,
+            )
+            return
+
+        button_name = button_name_map.get(number, str(number))
+        source_id = f"{source_base}/{button_name}"
+
+        logger.info(
+            f"Button {number} ({button_name}) {'pressed' if pressed else 'released'}"
+        )
+        publish_data(
+            session,
+            args.realm,
+            args.entity_id,
+            "button_state_change",
+            enclose_from_int(int(pressed), timestamp_ns),
+            source_id,
+        )
+
+    elif event_type == JS_EVENT_AXIS:
+        if number in axis_map:
+            axis_name = axis_map[number]
+            normalized = normalize_axis(value)
+            source_id = f"{source_base}/{axis_name}"
+
+            # Rate-limit per axis: skip if value barely changed AND interval too short
+            now_ns = time.time_ns()
+            prev = _axis_last_published.get(source_id)
+            if prev is not None:
+                prev_time, prev_val = prev
+                dt = now_ns - prev_time
+                dv = abs(normalized - prev_val)
+                if dt < AXIS_MIN_INTERVAL_NS and dv < AXIS_MIN_CHANGE:
+                    return  # skip -- too soon and value barely moved
+
+            _axis_last_published[source_id] = (now_ns, normalized)
+            logger.debug(f"Axis {number} ({axis_name}): {value} -> {normalized:.3f}")
+
+            publish_data(
+                session,
+                args.realm,
+                args.entity_id,
+                axis_name,
+                enclose_from_float(normalized, now_ns),
+                source_id,
+            )
+        else:
+            logger.debug(f"Ignoring unmapped axis {number}: {value}")
+
+
+def event_source_device(device_path):
+    """
+    Generator that yields joystick events from a Linux device file.
+
+    Opens /dev/input/jsX and reads 8-byte HID events.
+    """
+    path = Path(device_path)
+    if not path.exists():
+        logger.error(f"Joystick device {device_path} not found!")
+        logger.error("Available devices:")
+        input_dir = Path("/dev/input")
+        if input_dir.exists():
+            for dev in sorted(input_dir.glob("js*")):
+                logger.error(f"  {dev}")
+        sys.exit(1)
+
+    logger.info(f"Opening joystick device {device_path}...")
+    try:
+        js_device = open(device_path, "rb", buffering=0)
+        logger.info(f"Opened joystick device {device_path}")
+    except IOError as e:
+        logger.error(f"Failed to open joystick device {device_path}: {e}")
+        logger.error("Make sure you have permissions to read the device")
+        logger.error("Try: sudo chmod a+r /dev/input/js*")
+        sys.exit(1)
+
+    try:
+        while not shutdown_requested:
+            # Wait for data on the device fd instead of busy-polling with sleep
+            ready, _, _ = select.select([js_device], [], [], 0.01)
+            if ready:
+                event = read_joystick_event(js_device)
+                if event:
+                    yield event
+    finally:
+        js_device.close()
+        logger.info("Joystick device closed")
+
+
+def event_source_tcp(host, port):
+    """
+    Generator that yields joystick events from a TCP relay.
+
+    Connects to a host-side relay that reads the joystick and forwards
+    8-byte events over TCP. Reconnects automatically on disconnect.
+
+    To prevent buffer bloat during fast movement, all buffered events are
+    parsed at once and only the LATEST event per (type, number) is yielded.
+    This deduplicates axis values so subscribers always see the most recent state.
+    """
+    buf = b""
+    while not shutdown_requested:
+        try:
+            logger.info(f"Connecting to relay at {host}:{port}...")
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(1.0)
+            sock.connect((host, int(port)))
+            logger.info(f"Connected to relay at {host}:{port}")
+
+            while not shutdown_requested:
+                try:
+                    data = sock.recv(4096)
+                except socket.timeout:
+                    continue
+                if not data:
+                    logger.warning("Relay disconnected")
+                    break
+
+                buf += data
+
+                # Parse ALL buffered events, keep only latest per (type, number)
+                latest = {}  # (event_type, number) -> (timestamp, value, event_type, number)
+                button_events = []  # buttons are order-sensitive, keep all
+                while len(buf) >= 8:
+                    timestamp, value, event_type, number = struct.unpack(
+                        "IhBB", buf[:8]
+                    )
+                    buf = buf[8:]
+                    raw_type = event_type & ~0x80  # strip INIT flag
+                    if raw_type == 0x01:  # JS_EVENT_BUTTON -- keep all (press/release order matters)
+                        button_events.append((timestamp, value, event_type, number))
+                    else:  # JS_EVENT_AXIS -- only keep latest per axis number
+                        latest[(event_type, number)] = (timestamp, value, event_type, number)
+
+                # Yield button events first (order matters)
+                for ev in button_events:
+                    yield ev
+                # Yield only the latest value per axis
+                for ev in latest.values():
+                    yield ev
+
+        except (ConnectionRefusedError, OSError) as e:
+            logger.warning(f"Cannot connect to relay: {e}. Retrying in 1s...")
+        finally:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+        if not shutdown_requested:
+            time.sleep(1.0)
+
+
+def main():
+    # Parse arguments
+    args = terminal_inputs()
+
+    # Setup logging
+    logging.basicConfig(
+        format="%(asctime)s %(levelname)s %(name)s %(message)s", level=args.log_level
+    )
+    logging.captureWarnings(True)
+
+    # Setup signal handlers
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
+    # Configure Zenoh
+    conf = zenoh.Config()
+    if args.mode is not None:
+        conf.insert_json5("mode", json.dumps(args.mode))
+    if args.connect is not None:
+        conf.insert_json5("connect/endpoints", json.dumps(args.connect))
+
+    # Initialize Zenoh logging
+    zenoh.init_log_from_env_or(logging.getLevelName(args.log_level))
+
+    # Select event source
+    if args.relay:
+        parts = args.relay.rsplit(":", 1)
+        if len(parts) != 2:
+            logger.error(f"Invalid relay address: {args.relay} (expected host:port)")
+            sys.exit(1)
+        relay_host, relay_port = parts[0], parts[1]
+        source = event_source_tcp(relay_host, relay_port)
+        source_desc = f"TCP relay {args.relay}"
+    else:
+        source = event_source_device(args.device)
+        source_desc = f"device {args.device}"
+
+    # Load controller profile
+    profile = CONTROLLER_PROFILES[args.controller]
+    source_base = f"controller/{args.controller}"
+    logger.info(f"Controller profile: {args.controller}")
+
+    logger.info("Opening Zenoh session...")
+    with zenoh.open(conf) as session:
+        logger.info(f"Connected to realm: {args.realm}, entity: {args.entity_id}")
+        logger.info(f"Source base: {source_base}")
+        logger.info(f"Reading controller events from {source_desc}...")
+        axis_subjects = sorted(
+            set(profile["axis_map"].values()) | set(profile["button_to_axis"].values())
+        )
+        button_names = sorted(profile["button_name_map"].values())
+        logger.info(f"Axis subjects (TimestampedFloat): {', '.join(axis_subjects)}")
+        logger.info(f"Button names: {', '.join(button_names)}")
+        logger.info(f"Key pattern: {{subject}}/{source_base}/{{function}}")
+
+        event_count = 0
+
+        try:
+            for timestamp, value, event_type, number in source:
+                if shutdown_requested:
+                    break
+                event_count += 1
+                handle_joystick_event(
+                    timestamp,
+                    value,
+                    event_type,
+                    number,
+                    session,
+                    args,
+                    profile,
+                    source_base,
+                )
+
+        except KeyboardInterrupt:
+            logger.info("Interrupted by user")
+        except Exception as e:
+            logger.error(f"Error: {e}")
+            import traceback
+
+            logger.error(traceback.format_exc())
+        finally:
+            logger.info(f"Processed {event_count} events")
+
+
+if __name__ == "__main__":
+    main()
