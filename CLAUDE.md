@@ -21,8 +21,6 @@ black bin/*          # auto-format
 ```bash
 python examples/joystick_reader.py --list       # list available devices
 python examples/joystick_reader.py              # read joystick events live
-python test_poll_rate.py                        # measure poll rate (30s)
-python test_fast_buttons.py                     # measure button detection (15s)
 ```
 
 **Run the connector (Linux direct mode):**

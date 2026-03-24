@@ -29,7 +29,8 @@
       "Bash(docker manifest:*)",
       "Bash(for tag:*)",
       "Bash(do echo:*)",
-      "Bash(done)"
+      "Bash(done)",
+      "Bash(git rm:*)"
     ]
   }
 }
