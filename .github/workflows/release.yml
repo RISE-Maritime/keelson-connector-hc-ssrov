@@ -29,8 +29,8 @@ jobs:
           file: Dockerfile
           push: true
           tags: |
-            ghcr.io/rise-maritime/keelson-connector-hc-ssrov:latest
-            ghcr.io/rise-maritime/keelson-connector-hc-ssrov:${{ github.event.release.tag_name }}
+            ghcr.io/rise-maritime/keelson-connector-hand-controller:latest
+            ghcr.io/rise-maritime/keelson-connector-hand-controller:${{ github.event.release.tag_name }}
       -
         name: Image digest
         run: echo ${{ steps.docker_build.outputs.digest }}

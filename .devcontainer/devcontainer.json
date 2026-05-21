@@ -1,7 +1,7 @@
 // For format details, see https://aka.ms/devcontainer.json. For config options, see the
 // README at: https://github.com/devcontainers/templates/tree/main/src/python
 {
-	"name": "HC-ROV DevContainer",
+	"name": "Hand Controller DevContainer",
 	// Or use a Dockerfile or Docker Compose file. More info: https://containers.dev/guide/dockerfile
 	"image": "mcr.microsoft.com/devcontainers/python:dev-3.14-bookworm",
 	"features": {
@@ -10,7 +10,7 @@
 	"runArgs": [
 		"--network=host",
 		"--privileged",
-		"--name=devcon-hc-ssrov"
+		"--name=devcon-hc"
 		// To pass through devices, add one of these to runArgs when the device is connected:
 		// macOS serial:    "--device=/dev/cu.usbmodemHIDFG1:/dev/ttyACM0"
 		// Linux joystick:  "--device=/dev/input/js0:/dev/input/js0"
@@ -21,7 +21,7 @@
 	// "forwardPorts": [],
 	// Use 'postCreateCommand' to run commands after the container is created.
 	"remoteUser": "root",
-	"postCreateCommand": "pip install --upgrade pip && pip install --user -r requirements_dev.txt && apt-get update && apt-get install -y wget unzip cmake build-essential libusb-1.0-0-dev && echo 'Attempting to download SBG ECom library...' && cd /tmp && (wget https://download.sbg-systems.com/dev/sbgECom-3.2.765.zip -O sbgECom.zip && unzip sbgECom.zip -d sbgECom && rm sbgECom.zip && cd sbgECom && cmake -S . -B build -DCMAKE_INSTALL_PREFIX=/usr/local && cmake --build build -- -j$(nproc) && cmake --install build && ln -s /usr/local/bin/tools/sbgBasicLogger/sbgBasicLogger /usr/local/bin/sbgBasicLogger && ln -s /usr/local/bin/tools/sbgEComApi/sbgEComApi /usr/local/bin/sbgEComApi && echo 'SBG ECom library installed successfully') || echo 'WARNING: Failed to download SBG ECom library. You may need to install it manually later.'",
+	"postCreateCommand": "curl -LsSf https://astral.sh/uv/install.sh | sh && export PATH=\"$HOME/.local/bin:$PATH\" && uv pip install --system -r requirements_dev.txt",
 	"customizations": {
 		"vscode": {
 			"extensions": [
