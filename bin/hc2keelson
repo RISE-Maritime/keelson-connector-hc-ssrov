@@ -15,110 +15,110 @@ publish to button_pressed/button_released with the button number as value.
 """
 
 import sys
+import os
 import json
 import logging
 import time
+import threading
 import struct
 import signal
 import socket
 import select
-from datetime import datetime, timezone
+import traceback
 from typing import Dict, Any
 from pathlib import Path
+from urllib.parse import urlsplit
 
+import yaml
 import zenoh
 import keelson
 from keelson.payloads.Primitives_pb2 import TimestampedInt, TimestampedFloat
+from keelson.scaffolding.liveliness import declare_liveliness_token
 
 from terminal_inputs import terminal_inputs
+from joystick_proto import (
+    JS_EVENT_BUTTON,
+    JS_EVENT_AXIS,
+    JS_EVENT_INIT,
+    read_event,
+    normalize_axis,
+)
 
 # Global state
 PUBLISHERS: Dict[tuple, Any] = {}  # Cache for lazy publisher creation
 shutdown_requested = False  # Flag for graceful shutdown
 
-# Per-key axis rate limiter: prevents flooding subscribers at >200 Hz
-# Only publishes if value changed significantly OR enough time has elapsed
+# Per-key axis rate limiter state (thresholds come from CLI args)
 _axis_last_published: Dict[str, tuple] = {}  # source_id -> (time_ns, value)
-AXIS_MIN_INTERVAL_NS = 30_000_000  # 30ms = ~33 Hz max per axis
-AXIS_MIN_CHANGE = 0.01  # publish immediately if value changed by more than 1%
+
+# Shift modifier state — set when the active profile's shift_button is held
+_shift_held = False
+
+# Wall-clock timestamp (ns) of the last hardware event processed. Read by the
+# health publisher thread to decide whether the controller is alive or stale.
+# Updated inside handle_joystick_event.
+_last_event_ts_ns: int = 0
+
+# Search order for built-in profile YAML files (first hit wins)
+_PROFILES_DIR_CANDIDATES = [
+    Path(os.environ["HC_PROFILES_DIR"]) if os.environ.get("HC_PROFILES_DIR") else None,
+    Path(__file__).resolve().parent.parent / "profiles",
+    Path("/usr/local/share/hc-profiles"),
+]
 
 
-# Joystick event format (from linux/joystick.h)
-JS_EVENT_BUTTON = 0x01  # Button pressed/released
-JS_EVENT_AXIS = 0x02  # Joystick moved
-JS_EVENT_INIT = 0x80  # Initial state
+def _validate_profile(profile: dict) -> dict:
+    """Ensure required keys exist; coerce missing optional keys to defaults."""
+    required = {"axis_map", "button_name_map"}
+    missing = required - profile.keys()
+    if missing:
+        raise ValueError(f"Profile missing required keys: {sorted(missing)}")
+    profile.setdefault("button_to_axis", {})
+    profile.setdefault("shift_button", None)
+    profile.setdefault("shift_map", {})
+    return profile
 
-# Controller profiles: axis/button mappings per controller type
-# Key expression pattern:
-#   {realm}/@v0/{entity_id}/pubsub/{subject}/controller/{hw}/{function}
-# Where hw = controller type (ssrov, logitech) and function = control name
-CONTROLLER_PROFILES = {
-    # Seascape ROV Hand Controller
-    # Physical button N (1-indexed from manual) = Linux button N-1 (0-indexed)
-    "ssrov": {
-        "axis_map": {
-            0: "joystick_x",  # X axis
-            1: "joystick_y",  # Y axis
-            2: "joystick_z",  # Z axis (throttle)
-            3: "joystick_rz",  # Rz axis (rotation/twist)
-        },
-        "button_name_map": {
-            0: "grip_open",  # Button 1: Open Gripper
-            1: "grip_close",  # Button 2: Close Gripper
-            2: "lights_up",  # Button 3 (CCW): Lights Brighter
-            3: "lights_down",  # Button 4 (CW): Lights Dimmer
-            4: "gain_up",  # Button 5 (CCW): Increase Gain
-            5: "gain_down",  # Button 6 (CW): Decrease Gain
-            6: "tilt_up",  # Button 7: Camera Tilt Up
-            7: "tilt_down",  # Button 8: Camera Tilt Down
-            8: "shift",  # Button 9: Shift modifier
-            9: "mode_manual",  # Button 10: Manual Flight Mode
-            10: "mode_stabilize",  # Button 11: Stabilize
-            11: "mode_depth_hold",  # Button 12: Depth Hold
-            12: "mode_poshold",  # Button 13: Position Hold
-            13: "arm",  # Button 14: Arm ROV
-            14: "disarm",  # Button 15: Disarm ROV
-            15: "a",  # Button 16: User-defined
-            16: "b",  # Button 17: User-defined
-            17: "top_left",  # Button 18: User-defined
-            18: "top_right",  # Button 19: User-defined
-        },
-        "button_to_axis": {},
-    },
-    # Logitech F310/F710 Gamepad
-    # DirectInput mode (hardware switch on back set to "D")
-    # Shows as "Logitech Dual Action" — 4 analog axes, 12 buttons, 1 hat
-    # Axes 2-3 are right stick, 4-5 are dpad (hat converted to axis by kernel)
-    "logitech": {
-        "axis_map": {
-            0: "joystick_x",  # Left Stick X
-            1: "joystick_y",  # Left Stick Y
-            2: "joystick_rx",  # Right Stick X
-            3: "joystick_ry",  # Right Stick Y
-            4: "dpad_x",  # D-pad X (hat→axis)
-            5: "dpad_y",  # D-pad Y (hat→axis)
-        },
-        "button_name_map": {
-            0: "x",  # X (left face button)
-            1: "a",  # A (bottom face button)
-            2: "b",  # B (right face button)
-            3: "y",  # Y (top face button)
-            4: "lb",  # Left Bumper
-            5: "rb",  # Right Bumper
-            8: "back",  # Back
-            9: "start",  # Start
-            10: "l3",  # Left Stick Click
-            11: "r3",  # Right Stick Click
-        },
-        # Digital trigger buttons published as axis values (0.0 or 1.0)
-        "button_to_axis": {
-            6: "joystick_lt",  # LT button → axis
-            7: "joystick_rt",  # RT button → axis
-        },
-    },
-}
+
+def load_profile(name_or_path: str) -> dict:
+    """Load a controller profile from YAML.
+
+    If `name_or_path` resolves to an existing file, load it directly (custom
+    profile). Otherwise treat it as a built-in profile name and search
+    `_PROFILES_DIR_CANDIDATES` for `<name>.yaml`.
+    """
+    p = Path(name_or_path)
+    if p.is_file():
+        with open(p, encoding="utf-8") as fh:
+            return _validate_profile(yaml.safe_load(fh))
+
+    for candidate in _PROFILES_DIR_CANDIDATES:
+        if candidate is None:
+            continue
+        path = candidate / f"{name_or_path}.yaml"
+        if path.is_file():
+            with open(path, encoding="utf-8") as fh:
+                return _validate_profile(yaml.safe_load(fh))
+
+    searched = [str(c) for c in _PROFILES_DIR_CANDIDATES if c is not None]
+    raise FileNotFoundError(f"Profile {name_or_path!r} not found (searched {searched})")
+
 
 logger = logging.getLogger("hc2keelson")
+
+
+class JsonFormatter(logging.Formatter):
+    """Emit one JSON object per log line for container log pipelines."""
+
+    def format(self, record):
+        payload = {
+            "ts": self.formatTime(record, "%Y-%m-%dT%H:%M:%S%z"),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+        if record.exc_info:
+            payload["exc"] = self.formatException(record.exc_info)
+        return json.dumps(payload)
 
 
 def signal_handler(signum, frame):
@@ -178,53 +178,28 @@ def enclose_from_float(value: float, timestamp_ns: int | None = None) -> bytes:
     return keelson.enclose(payload.SerializeToString())
 
 
-def normalize_axis(value: int) -> float:
-    """Normalize int16 axis value to -1.0..1.0 range."""
-    return max(-1.0, min(1.0, value / 32767.0))
-
-
-def read_joystick_event(device_file):
-    """
-    Read a single joystick event from the device.
-
-    Event format (8 bytes):
-        - timestamp (4 bytes, unsigned int)
-        - value (2 bytes, signed short)
-        - type (1 byte, unsigned char)
-        - number (1 byte, unsigned char)
-
-    Returns:
-        tuple: (timestamp, value, event_type, number) or None if no data
-    """
-    try:
-        event_data = device_file.read(8)
-        if len(event_data) < 8:
-            return None
-
-        # Unpack event: timestamp (I), value (h), type (B), number (B)
-        timestamp, value, event_type, number = struct.unpack("IhBB", event_data)
-        return (timestamp, value, event_type, number)
-    except Exception as e:
-        logger.debug(f"Error reading joystick event: {e}")
-        return None
-
-
 def handle_joystick_event(
     timestamp, value, event_type, number, session, args, profile, source_base
 ):
     """
     Handle a joystick event and publish to Keelson.
 
-    Source-id pattern: controller/{hw}/{function}
+    Source-id pattern: <controller_id>/<input_name>
 
-    - Axes publish as TimestampedFloat (normalized -1.0 to 1.0)
+    - Axes publish as TimestampedFloat in percent (-100.0 to 100.0)
     - Buttons publish as TimestampedInt (1=pressed, 0=released) to subject "button_state_change"
-    - Digital triggers in button_to_axis publish as TimestampedFloat (0.0 or 1.0)
+    - Digital triggers in button_to_axis publish as TimestampedFloat (0.0 or 100.0)
+    - When the profile's shift_button is held, buttons in shift_map publish under
+      their shifted name. The shift button itself still publishes its own event.
     """
+    global _shift_held, _last_event_ts_ns
     timestamp_ns = time.time_ns()
+    _last_event_ts_ns = timestamp_ns
     axis_map = profile["axis_map"]
     button_name_map = profile["button_name_map"]
     button_to_axis = profile["button_to_axis"]
+    shift_button = profile.get("shift_button")
+    shift_map = profile.get("shift_map", {})
 
     # Remove INIT flag to get actual event type
     event_type = event_type & ~JS_EVENT_INIT
@@ -232,10 +207,10 @@ def handle_joystick_event(
     if event_type == JS_EVENT_BUTTON:
         pressed = value == 1
 
-        # Digital trigger → publish as axis (0.0 or 1.0)
+        # Digital trigger → publish as axis (0.0 or 100.0)
         if number in button_to_axis:
             axis_name = button_to_axis[number]
-            axis_value = 1.0 if pressed else 0.0
+            axis_value = 100.0 if pressed else 0.0
             source_id = f"{source_base}/{axis_name}"
             logger.info(f"Trigger {number} ({axis_name}): {axis_value}")
             publish_data(
@@ -248,7 +223,18 @@ def handle_joystick_event(
             )
             return
 
-        button_name = button_name_map.get(number, str(number))
+        # Update shift state when the shift button is pressed/released
+        # (the shift button still publishes its own event below).
+        if shift_button is not None and number == shift_button:
+            _shift_held = pressed
+
+        # Resolve button name: shifted variant if shift is held, else normal.
+        # Edge case: a release that arrives after shift was released will use
+        # the non-shifted name even if the press was shifted. Tolerated for v1.
+        if _shift_held and number in shift_map:
+            button_name = shift_map[number]
+        else:
+            button_name = button_name_map.get(number, str(number))
         source_id = f"{source_base}/{button_name}"
 
         logger.info(
@@ -269,6 +255,16 @@ def handle_joystick_event(
             normalized = normalize_axis(value)
             source_id = f"{source_base}/{axis_name}"
 
+            # Optional center-snap: clean up joystick ADC rest offset by snapping
+            # near-zero values to exact 0.0 before the rate-limit check. Without
+            # this, a released stick publishes its residual offset (e.g. -0.39 %)
+            # and the deadband then freezes that residual in place.
+            if (
+                args.axis_center_snap_pct > 0
+                and abs(normalized) < args.axis_center_snap_pct
+            ):
+                normalized = 0.0
+
             # Rate-limit per axis: skip if value barely changed AND interval too short
             now_ns = time.time_ns()
             prev = _axis_last_published.get(source_id)
@@ -276,7 +272,10 @@ def handle_joystick_event(
                 prev_time, prev_val = prev
                 dt = now_ns - prev_time
                 dv = abs(normalized - prev_val)
-                if dt < AXIS_MIN_INTERVAL_NS and dv < AXIS_MIN_CHANGE:
+                if (
+                    dt < args.axis_min_interval_ms * 1_000_000
+                    and dv < args.axis_min_change
+                ):
                     return  # skip -- too soon and value barely moved
 
             _axis_last_published[source_id] = (now_ns, normalized)
@@ -325,7 +324,7 @@ def event_source_device(device_path):
             # Wait for data on the device fd instead of busy-polling with sleep
             ready, _, _ = select.select([js_device], [], [], 0.01)
             if ready:
-                event = read_joystick_event(js_device)
+                event = read_event(js_device)
                 if event:
                     yield event
     finally:
@@ -333,25 +332,35 @@ def event_source_device(device_path):
         logger.info("Joystick device closed")
 
 
-def event_source_tcp(host, port):
+def event_source_tcp(host: str, port: int, max_retries: int = 0):
     """
     Generator that yields joystick events from a TCP relay.
 
     Connects to a host-side relay that reads the joystick and forwards
-    8-byte events over TCP. Reconnects automatically on disconnect.
+    8-byte events over TCP. Reconnects automatically on disconnect with
+    exponential backoff (1s, 2s, 4s, ..., capped at 30s).
+
+    max_retries=0 means unlimited (default); a positive value exits the
+    generator after that many consecutive connect failures.
 
     To prevent buffer bloat during fast movement, all buffered events are
     parsed at once and only the LATEST event per (type, number) is yielded.
     This deduplicates axis values so subscribers always see the most recent state.
     """
     buf = b""
+    retry_count = 0
+    backoff_seconds = 1.0
+    max_backoff = 30.0
+
     while not shutdown_requested:
+        sock = None
         try:
             logger.info(f"Connecting to relay at {host}:{port}...")
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock = socket.create_connection((host, port), timeout=1.0)
             sock.settimeout(1.0)
-            sock.connect((host, int(port)))
             logger.info(f"Connected to relay at {host}:{port}")
+            retry_count = 0
+            backoff_seconds = 1.0  # reset on successful connect
 
             while not shutdown_requested:
                 try:
@@ -365,7 +374,9 @@ def event_source_tcp(host, port):
                 buf += data
 
                 # Parse ALL buffered events, keep only latest per (type, number)
-                latest = {}  # (event_type, number) -> (timestamp, value, event_type, number)
+                latest = (
+                    {}
+                )  # (event_type, number) -> (timestamp, value, event_type, number)
                 button_events = []  # buttons are order-sensitive, keep all
                 while len(buf) >= 8:
                     timestamp, value, event_type, number = struct.unpack(
@@ -373,38 +384,89 @@ def event_source_tcp(host, port):
                     )
                     buf = buf[8:]
                     raw_type = event_type & ~0x80  # strip INIT flag
-                    if raw_type == 0x01:  # JS_EVENT_BUTTON -- keep all (press/release order matters)
+                    if raw_type == 0:
+                        continue  # pure-INIT or unknown event type, nothing to dispatch
+                    if (
+                        raw_type == 0x01
+                    ):  # JS_EVENT_BUTTON -- keep all (press/release order matters)
                         button_events.append((timestamp, value, event_type, number))
                     else:  # JS_EVENT_AXIS -- only keep latest per axis number
-                        latest[(event_type, number)] = (timestamp, value, event_type, number)
+                        latest[(event_type, number)] = (
+                            timestamp,
+                            value,
+                            event_type,
+                            number,
+                        )
 
                 # Yield button events first (order matters)
-                for ev in button_events:
-                    yield ev
+                yield from button_events
                 # Yield only the latest value per axis
-                for ev in latest.values():
-                    yield ev
+                yield from latest.values()
 
         except (ConnectionRefusedError, OSError) as e:
-            logger.warning(f"Cannot connect to relay: {e}. Retrying in 1s...")
+            retry_count += 1
+            if 0 < max_retries <= retry_count:
+                logger.error(
+                    f"Relay unreachable after {retry_count} attempts; giving up."
+                )
+                return
+            logger.warning(
+                f"Cannot connect to relay: {e}. "
+                f"Retry #{retry_count} in {backoff_seconds:.1f}s..."
+            )
         finally:
-            try:
-                sock.close()
-            except Exception:
-                pass
+            if sock is not None:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
 
         if not shutdown_requested:
-            time.sleep(1.0)
+            time.sleep(backoff_seconds)
+            backoff_seconds = min(backoff_seconds * 2, max_backoff)
+
+
+def _health_publisher_loop(session, args, source_base: str, stop_event: threading.Event):
+    """Background loop that publishes controller_health at args.health_interval_s.
+
+    Publishes 1 (alive) when a hardware event arrived within args.health_stale_s,
+    otherwise 0 (stale). Source-id is the controller base, matching the
+    convention for axis/button source-ids.
+    """
+    interval = max(0.1, args.health_interval_s)
+    stale_ns = int(args.health_stale_s * 1_000_000_000)
+    while not stop_event.wait(interval):
+        if shutdown_requested:
+            return
+        now_ns = time.time_ns()
+        alive = _last_event_ts_ns > 0 and (now_ns - _last_event_ts_ns) <= stale_ns
+        try:
+            publish_data(
+                session,
+                args.realm,
+                args.entity_id,
+                "controller_health",
+                enclose_from_int(1 if alive else 0, now_ns),
+                source_base,
+            )
+        except Exception:
+            logger.exception("controller_health publish failed")
 
 
 def main():
     # Parse arguments
     args = terminal_inputs()
 
-    # Setup logging
-    logging.basicConfig(
-        format="%(asctime)s %(levelname)s %(name)s %(message)s", level=args.log_level
-    )
+    # Setup logging — JSON or human-readable
+    handler = logging.StreamHandler()
+    if args.log_json:
+        handler.setFormatter(JsonFormatter())
+    else:
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+        )
+    logging.root.handlers = [handler]
+    logging.root.setLevel(args.log_level)
     logging.captureWarnings(True)
 
     # Setup signal handlers
@@ -423,26 +485,40 @@ def main():
 
     # Select event source
     if args.relay:
-        parts = args.relay.rsplit(":", 1)
-        if len(parts) != 2:
+        try:
+            parsed = urlsplit(f"//{args.relay}")
+            relay_host = parsed.hostname
+            relay_port = parsed.port
+        except ValueError:
+            relay_host = None
+            relay_port = None
+        if not relay_host or relay_port is None:
             logger.error(f"Invalid relay address: {args.relay} (expected host:port)")
             sys.exit(1)
-        relay_host, relay_port = parts[0], parts[1]
-        source = event_source_tcp(relay_host, relay_port)
+        source = event_source_tcp(relay_host, relay_port, args.relay_max_retries)
         source_desc = f"TCP relay {args.relay}"
     else:
         source = event_source_device(args.device)
         source_desc = f"device {args.device}"
 
-    # Load controller profile
-    profile = CONTROLLER_PROFILES[args.controller]
-    source_base = f"controller/{args.controller}"
-    logger.info(f"Controller profile: {args.controller}")
+    # Load controller profile (custom path takes precedence over built-in name)
+    profile_ref = args.controller_config or args.controller
+    try:
+        profile = load_profile(profile_ref)
+    except (FileNotFoundError, ValueError) as e:
+        logger.error(f"Failed to load controller profile {profile_ref!r}: {e}")
+        sys.exit(1)
+    source_base = args.source_id or args.controller
+    logger.info(f"Controller profile: {profile_ref} (source-base: {source_base})")
 
     logger.info("Opening Zenoh session...")
-    with zenoh.open(conf) as session:
+    with (
+        zenoh.open(conf) as session,
+        declare_liveliness_token(session, args.realm, args.entity_id, source_base),
+    ):
         logger.info(f"Connected to realm: {args.realm}, entity: {args.entity_id}")
         logger.info(f"Source base: {source_base}")
+        logger.info("Declared liveliness token (controller alive)")
         logger.info(f"Reading controller events from {source_desc}...")
         axis_subjects = sorted(
             set(profile["axis_map"].values()) | set(profile["button_to_axis"].values())
@@ -451,6 +527,15 @@ def main():
         logger.info(f"Axis subjects (TimestampedFloat): {', '.join(axis_subjects)}")
         logger.info(f"Button names: {', '.join(button_names)}")
         logger.info(f"Key pattern: {{subject}}/{source_base}/{{function}}")
+
+        health_stop = threading.Event()
+        health_thread = threading.Thread(
+            target=_health_publisher_loop,
+            args=(session, args, source_base, health_stop),
+            name="hc-health",
+            daemon=True,
+        )
+        health_thread.start()
 
         event_count = 0
 
@@ -474,10 +559,10 @@ def main():
             logger.info("Interrupted by user")
         except Exception as e:
             logger.error(f"Error: {e}")
-            import traceback
-
             logger.error(traceback.format_exc())
         finally:
+            health_stop.set()
+            health_thread.join(timeout=2.0)
             logger.info(f"Processed {event_count} events")
 
 

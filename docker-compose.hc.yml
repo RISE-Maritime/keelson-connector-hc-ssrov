@@ -1,62 +1,35 @@
+# Keelson Hand Controller connector — both controllers, no profiles
+#
+# Same as docker-compose.hc.yml but without `profiles:` gates, so a plain
+# `up` starts both the SSROV and Logitech connectors at once.
+#
+# Quick start:
+#   1. Start the host-side relays (one terminal per controller):
+#        SSROV:    uv run bin/hid_relay.py --port 9090
+#        Logitech: uv run bin/hid_relay.py --no-mfi --port 9091   # --no-mfi only on macOS
+#   2. Bring up both connectors:
+#        docker compose -f docker-compose.hc.all.yml up
+#
+# To tweak: edit `command:` below — change --realm (-r), --entity-id (-e), log level,
+# or relay port. For a non-default Zenoh router, append e.g.
+#   --mode client --connect tcp/localhost:7447
+
+x-hc-base: &hc-base
+  build: .
+  restart: unless-stopped
+  network_mode: "host"
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+
 services:
+  ssrov:
+    <<: *hc-base
+    container_name: keelson-connector-ssrov
+    command: ["hc2keelson --log-level 20 -r rise -e ssrs18 --controller ssrov --axis-center-snap-pct 1.0 --relay host.docker.internal:9090"]
 
-  # Hand Controller to Keelson (LINUX-only, direct device access)
-  # hc-to-keelson:
-  #   build: .
-  #   # image: ghcr.io/rise-maritime/keelson-connector-hand-controller:latest
-  #   container_name: keelson-connector-hc
-  #   restart: unless-stopped
-  #   network_mode: "host"
-  #   privileged: true
-  #   devices:
-  #     - /dev/input/js0:/dev/input/js0
-  #   command: ["hc2keelson --log-level 20 -r rise -e rov --device /dev/input/js0"]
+  logitech:
+    <<: *hc-base
+    container_name: keelson-connector-logitech
+    command: ["hc2keelson --log-level 20 -r rise -e ssrs18 --controller logitech --axis-center-snap-pct 1.0 --relay host.docker.internal:9091"]
 
-  # Alternative: Connect to specific Zenoh router
-  # hc-to-keelson-client:
-  #   build: .
-  #   # image: ghcr.io/rise-maritime/keelson-connector-hand-controller:latest
-  #   container_name: keelson-connector-hc-client
-  #   restart: unless-stopped
-  #   network_mode: "host"
-  #   privileged: true
-  #   devices:
-  #     - /dev/input/js0:/dev/input/js0
-  #   command: ["hc2keelson --log-level 20 -r rise -e rov --device /dev/input/js0 --mode client --connect tcp/localhost:7447"]
-  #   profiles: ["client"]
 
-  # Cross-platform relay mode (macOS/Windows/Linux)
-  # Requires hid_relay.py running on the host: python bin/hid_relay.py --port 9090
-  hc-to-keelson-relay:
-    build: .
-    container_name: keelson-connector-hc-relay
-    restart: unless-stopped
-    network_mode: "host"
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    command: ["hc2keelson --log-level 10 -r rise -e rov --relay host.docker.internal:9090"]
-    # profiles: ["relay"]
-
-  # Cross-platform relay mode + client Zenoh connection
-  # hc-to-keelson-relay-client:
-  #   build: .
-  #   container_name: keelson-connector-hc-relay-client
-  #   restart: unless-stopped
-  #   network_mode: "host"
-  #   extra_hosts:
-  #     - "host.docker.internal:host-gateway"
-  #   command: ["hc2keelson --log-level 20 -r rise -e rov --relay host.docker.internal:9090 --mode client --connect tcp/localhost:7447"]
-  #   profiles: ["relay-client"]
-
-  # Logitech F310/F710 gamepad - relay mode (macOS/Windows/Linux)
-  # Requires separate relay on host: python bin/hid_relay.py --no-mfi --port 9091
-  # (--no-mfi is needed on macOS because GCController exclusively claims the Logitech)
-  logitech-to-keelson-relay:
-    build: .
-    container_name: keelson-connector-logitech-relay
-    restart: unless-stopped
-    network_mode: "host"
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    command: ["hc2keelson --log-level 10 -r rise -e rov --controller logitech --relay host.docker.internal:9091"]
-    # profiles: ["logitech-relay"]

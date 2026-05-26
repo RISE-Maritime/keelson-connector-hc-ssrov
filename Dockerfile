@@ -1,18 +1,21 @@
-FROM --platform=linux/amd64 python:3.13-slim-bookworm
+FROM python:3.13-slim-bookworm
 
-# tini for signal handling
-ADD https://github.com/krallin/tini/releases/download/v0.19.0/tini /tini
-RUN chmod +x /tini
-
-# Build tools needed for eclipse-zenoh Rust compilation
-RUN apt-get update && apt-get install -y --no-install-recommends build-essential && rm -rf /var/lib/apt/lists/*
+# tini for signal handling (signed Debian package)
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends tini \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
-COPY requirements.txt requirements.txt
-
-RUN uv pip install --system --no-cache -r requirements.txt
+COPY pyproject.toml pyproject.toml
+COPY README.md README.md
+RUN uv pip install --system --no-cache .
 
 COPY --chmod=555 ./bin/* /usr/local/bin/
+COPY profiles /usr/local/share/hc-profiles
 
-ENTRYPOINT ["/tini", "-g", "--", "/bin/bash", "-c"]
+# Run as non-root (principle of least privilege)
+RUN useradd --uid 10001 --no-create-home --shell /usr/sbin/nologin app
+USER app
+
+ENTRYPOINT ["/usr/bin/tini", "-g", "--", "/bin/bash", "-c"]

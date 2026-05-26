@@ -6,8 +6,8 @@ Reads joystick and gamepad controllers and publishes axes and button events to t
 
 | Controller | Flag | Subject Naming | Shift Logic |
 |------------|------|---------------|-------------|
-| [Seascape ROV Hand Controller](https://www.seascapesubsea.com/product/rov-hand-controller/) | `--controller ssrov` (default) | ROV-function names (`arm`, `joystick_x`) | Yes (button 9) |
-| Logitech F310 / F710 Gamepad | `--controller logitech` | Hardware names (`button_a`, `left_stick_x`) | No |
+| [Seascape ROV Hand Controller](https://www.seascapesubsea.com/product/rov-hand-controller/) | `--controller ssrov` (default) | ROV-function names (`arm`, `joystick_x_pct`) | Yes (button 9) |
+| Logitech F310 / F710 Gamepad | `--controller logitech` | Hardware names (`a`, `joystick_x_pct`) | No |
 
 [SSROV DATASHEET.pdf](./doc/SSROV-HC-DATASHEET.pdf) | [SSROV MANUAL.pdf](./doc/SSROV-HC-MANUAL.pdf)
 
@@ -18,8 +18,8 @@ Reads joystick and gamepad controllers and publishes axes and button events to t
 **Key Features:**
 - Real-time axes updates and fast button detection (press & release events)
 - Same joystick HID interface used by QGroundControl
-- Cross-platform via TCP relay (macOS/Windows) or direct device access (Linux)
-- Docker container deployment
+- Cross-platform via TCP relay — works identically on Linux, macOS, and Windows
+- Docker container deployment (single compose file)
 
 **Why Joystick Interface?**
 
@@ -31,26 +31,30 @@ The Seascape controller exposes two interfaces:
 
 ## Quick Start
 
-### Linux (Direct Device Access)
+The same flow works on Linux, macOS, and Windows: a host-side relay reads the controller (pygame) and forwards events over TCP to the container.
+
+> ⚠️ **The relay MUST run on the host, not in Docker, and MUST be started before `docker compose up`.**
+> Docker Desktop on macOS and Windows runs containers inside a Linux VM that has no access to host USB devices,
+> so pygame cannot see the controller from inside a container. The relay is the bridge — it reads the USB
+> joystick natively on your OS and exposes it over TCP for the container to consume. There is no way to start
+> the relay from a compose service; it has to be a host process. If the relay isn't running when the container
+> starts, you'll see `Cannot connect to relay: [Errno 111] Connection refused` in the container logs.
 
 ```bash
-# Run directly
-python3 bin/hc2keelson -r rise -e rov
-```
+# 1. Start relay(s) on the HOST — one per controller, separate ports, each in its own terminal
 
-### macOS / Windows (TCP Relay)
-
-Since Docker Desktop cannot pass USB devices to containers, a host-side relay bridges the controller to the container over TCP.
-
-```bash
-# 1. Start relay(s) on host — one per controller, separate ports
+# MAC
 uv run bin/hid_relay.py --port 9090                             # SSROV
 uv run bin/hid_relay.py --no-mfi --port 9091 --joystick-index 0 # Logitech
 
-# 2. Start the container(s)
-docker compose -f docker-compose.hc.yml --profile relay up                     # SSROV only
-docker compose -f docker-compose.hc.yml --profile relay --profile logitech-relay up  # Both
+# 2. THEN start the container(s) in another terminal
+docker compose -f docker-compose.hc.yml --profile ssrov up                       # SSROV only
+docker compose -f docker-compose.hc.yml --profile logitech up                    # Logitech only
+docker compose -f docker-compose.hc.yml --profile ssrov --profile logitech up    # Both
 ```
+
+**Running on bare-metal Linux without Docker?** You can read the device directly:
+`python3 bin/hc2keelson -r rise -e rov --device /dev/input/js0`
 
 > **macOS note:** The `--no-mfi` flag is required for the Logitech F310 on macOS. Apple's
 > GCController framework exclusively claims known gamepads, hiding them from SDL. Running
@@ -66,36 +70,42 @@ docker compose -f docker-compose.hc.yml --profile relay --profile logitech-relay
 
 ## Published Keelson Subjects
 
+Subject names follow the canonical [keelson 0.5.x](https://rise-maritime.github.io/keelson/) definitions in `messages/subjects.yaml`. Axis subjects carry the `_pct` suffix and values in **percent**.
+
 | Subject | Type | Description | Value Range |
 |---------|------|-------------|-------------|
-| `joystick_x` | TimestampedInt | X axis (left-right) | -32768 to 32767 |
-| `joystick_y` | TimestampedInt | Y axis (forward-back) | -32768 to 32767 |
-| `joystick_rz` | TimestampedInt | Rotation Z (twist) | -32768 to 32767 |
-| `joystick_z` | TimestampedInt | Z axis/throttle | -32768 to 32767 |
-| `{function}` | TimestampedInt | Mapped button event | 1 (pressed) / 0 (released) |
-| `button_pressed` | TimestampedInt | Unmapped button pressed | Button number |
-| `button_released` | TimestampedInt | Unmapped button released | Button number |
+| `joystick_x_pct` | TimestampedFloat | X axis (left-right) | -100.0 to 100.0 |
+| `joystick_y_pct` | TimestampedFloat | Y axis (forward-back) | -100.0 to 100.0 |
+| `joystick_z_pct` | TimestampedFloat | Z axis / throttle | -100.0 to 100.0 |
+| `joystick_rx_pct` | TimestampedFloat | Rotation X (roll) | -100.0 to 100.0 |
+| `joystick_ry_pct` | TimestampedFloat | Rotation Y (pitch) | -100.0 to 100.0 |
+| `joystick_rz_pct` | TimestampedFloat | Rotation Z (twist/yaw) | -100.0 to 100.0 |
+| `dpad_x_pct` | TimestampedFloat | D-pad horizontal | -100.0 / 0.0 / 100.0 |
+| `dpad_y_pct` | TimestampedFloat | D-pad vertical | -100.0 / 0.0 / 100.0 |
+| `joystick_lt_pct` | TimestampedFloat | Left trigger | 0.0 / 100.0 |
+| `joystick_rt_pct` | TimestampedFloat | Right trigger | 0.0 / 100.0 |
+| `button_state_change` | TimestampedInt | Button event | 1 (pressed) / 0 (released) |
 
 **Key Expression Pattern:**
 
 ```
-{realm}/@v0/{entity_id}/pubsub/{subject}/controller/{hw}/{function}
-# e.g.: rise/@v0/rov/pubsub/joystick_x/controller/ssrov/joystick_x
-# e.g.: rise/@v0/rov/pubsub/button_state_change/controller/ssrov/arm
+{realm}/@v0/{entity_id}/pubsub/{subject}/<controller_id>/<input_name>
+# e.g.: rise/@v0/rov/pubsub/joystick_x_pct/ssrov/joystick_x_pct
+# e.g.: rise/@v0/rov/pubsub/button_state_change/ssrov/arm
 ```
 
 ### SSROV Button Mapping (`--controller ssrov`)
 
 | Button | Primary Function | Shift + Button |
 |--------|-----------------|----------------|
-| 1 | `servo_3_min_momentary` (Open Gripper) | `input_hold_set` |
-| 2 | `servo_3_max_momentary` (Close Gripper) | `roll_pitch_toggle` |
-| 3 (CCW) | `lights1_brighter` | `trim_roll_inc` |
-| 4 (CW) | `lights1_dimmer` | `trim_roll_dec` |
-| 5 (CCW) | `gain_inc` | `trim_pitch_inc` |
-| 6 (CW) | `gain_dec` | `trim_pitch_dec` |
-| 7 | `mount_tilt_up` | |
-| 8 | `mount_tilt_down` | |
+| 1 | `grip_open` (Open Gripper) | `input_hold_set` |
+| 2 | `grip_close` (Close Gripper) | `roll_pitch_toggle` |
+| 3 (CCW) | `lights_up` | `trim_roll_inc` |
+| 4 (CW) | `lights_down` | `trim_roll_dec` |
+| 5 (CCW) | `gain_up` | `trim_pitch_inc` |
+| 6 (CW) | `gain_down` | `trim_pitch_dec` |
+| 7 | `tilt_up` | |
+| 8 | `tilt_down` | |
 | 9 | `shift` (modifier) | |
 | 10 | `mode_manual` | |
 | 11 | `mode_stabilize` | |
@@ -103,7 +113,7 @@ docker compose -f docker-compose.hc.yml --profile relay --profile logitech-relay
 | 13 | `mode_poshold` | |
 | 14 | `arm` | |
 | 15 | `disarm` | |
-| 16-19 | User-defined (`a`, `b`, `joystick_top_left`, `joystick_top_right`) | |
+| 16-19 | User-defined (`a`, `b`, `top_left`, `top_right`) | |
 
 ### Logitech F310/F710 Mapping (`--controller logitech`)
 
@@ -113,12 +123,16 @@ Generic naming — no shift logic. Set the hardware switch on back to **D** (Dir
 
 | Control | Subject | Value Range |
 |---------|---------|-------------|
-| Left Stick X | `joystick_x` | -32768 to 32767 |
-| Left Stick Y | `joystick_y` | -32768 to 32767 |
-| Right Stick X | `joystick_rx` | -32768 to 32767 |
-| Right Stick Y | `joystick_ry` | -32768 to 32767 |
+| Left Stick X | `joystick_x_pct` | -100.0 to 100.0 |
+| Left Stick Y | `joystick_y_pct` | -100.0 to 100.0 |
+| Right Stick X | `joystick_rx_pct` | -100.0 to 100.0 |
+| Right Stick Y | `joystick_ry_pct` | -100.0 to 100.0 |
+| D-pad X | `dpad_x_pct` | -100.0 / 0.0 / 100.0 |
+| D-pad Y | `dpad_y_pct` | -100.0 / 0.0 / 100.0 |
+| LT (digital trigger) | `joystick_lt_pct` | 0.0 / 100.0 |
+| RT (digital trigger) | `joystick_rt_pct` | 0.0 / 100.0 |
 
-**Buttons:** All buttons publish to `button_pressed` / `button_released` with the button number as value.
+**Buttons:** All buttons publish to `button_state_change` (1=pressed, 0=released). Source-id carries the button name (e.g. `logitech/a`); unmapped buttons use the numeric index.
 
 | Button # | Physical Control |
 |----------|-----------------|
@@ -139,6 +153,14 @@ Generic naming — no shift logic. Set the hardware switch on back to **D** (Dir
 | 14 | D-pad Left |
 | 15 | D-pad Right |
 
+### Custom Controller Profiles
+
+Profiles are YAML files in [profiles/](profiles/) — `ssrov.yaml` and `logitech.yaml` ship with the project. To support a new controller, drop a YAML file in `profiles/` (use `--controller name` to pick it up) or anywhere else (use `--controller-config /path/to/file.yaml`).
+
+The schema mirrors the bundled examples — see [profiles/ssrov.yaml](profiles/ssrov.yaml). Required keys: `axis_map` and `button_name_map` (both `int -> str`). Optional: `button_to_axis` (digital triggers published as axis values), `shift_button` (button index acting as a modifier), `shift_map` (shifted-name overrides for buttons while shift is held).
+
+In the container, custom profiles can be mounted at `/usr/local/share/hc-profiles/<name>.yaml` and selected with `--controller <name>`, or mounted anywhere and selected with `--controller-config <path>`. The `HC_PROFILES_DIR` env var overrides the search path.
+
 ---
 
 ## Usage
@@ -154,8 +176,23 @@ Device Configuration:
   --device, -d DEVICE            Joystick device path (default: "/dev/input/js0")
   --relay HOST:PORT              TCP relay address for cross-platform mode
                                  (e.g. --relay host.docker.internal:9090)
-  -c, --controller {ssrov,logitech}
-                                 Controller profile for axis/button mapping (default: ssrov)
+  --relay-max-retries N          Max relay connect attempts before exit
+                                 (default: 0 = unlimited; backoff 1s..30s)
+  -c, --controller NAME          Built-in profile name (resolves to
+                                 profiles/<name>.yaml). Default: ssrov
+  --controller-config PATH       Path to a custom controller-profile YAML.
+                                 Overrides --controller.
+
+Rate limiting (per-axis):
+  --axis-min-interval-ms MS      Skip publish if last publish was <MS ago
+                                 AND value barely changed (default: 30)
+  --axis-min-change PCT          Percentage-point change that always
+                                 forces an immediate publish (default: 1.0)
+  --axis-center-snap-pct PCT     Snap |value| < PCT to exactly 0.0 before
+                                 rate-limiting. Cleans up joystick ADC rest
+                                 offset so a released stick publishes 0.0
+                                 instead of a residual like -0.39.
+                                 0 disables; recommended 2.0 (default: 0.0)
 
 Zenoh Configuration:
   --mode {peer,client}           Zenoh session mode (default: peer)
@@ -163,9 +200,16 @@ Zenoh Configuration:
 
 Logging:
   --log-level LEVEL              10=DEBUG, 20=INFO, 30=WARN (default: 20)
+  --log-json                     One JSON object per line (for container
+                                 log pipelines like Loki/Datadog/GCP)
 ```
 
-Source-id is constructed automatically as `controller/{hw}/{function}` from the `--controller` flag.
+> ℹ️ **Axis and D-pad events log at DEBUG (10); button events at INFO (20).** Run with
+> `--log-level 10` to verify joystick / D-pad activity is actually being received — at the
+> default INFO level you'll only see button press/release lines, even though axes and D-pad
+> are being published normally.
+
+Source-id is constructed automatically as `<controller_id>/<input_name>` from the `--controller` flag (e.g. `ssrov/joystick_x_pct`, `logitech/a`).
 
 ### Examples
 
@@ -193,25 +237,29 @@ python3 bin/hc2keelson -r rise -e rov \
 
 ### Docker Compose Profiles
 
-| Profile | Mode | Platform | Description |
-|---------|------|----------|-------------|
-| `relay` | TCP relay (SSROV) | All | Connects to host-side `hid_relay.py` on port 9090 |
-| `logitech-relay` | TCP relay (Logitech) | All | Logitech F310/F710 via `hid_relay.py` on port 9091 |
+| Profile    | Controller         | Platform | Description                                       |
+|------------|--------------------|----------|---------------------------------------------------|
+| `ssrov`    | SSROV              | All      | Connects to host-side `hid_relay.py` on port 9090 |
+| `logitech` | Logitech F310/F710 | All      | Connects to host-side `hid_relay.py` on port 9091 |
 
-> **Note:** Linux direct-device services and client-mode variants are defined but commented out in the compose file. Uncomment and adjust as needed.
+To customise (realm, entity-id, log level, port, Zenoh router), edit the `command:` line of the relevant service in `docker-compose.hc.yml`. For a non-default Zenoh router, append `--mode client --connect tcp/host:7447` to the command.
+
+> ⚠️ **The host-side `hid_relay.py` is not — and cannot be — part of docker compose.** It must be running on
+> the host before `docker compose up`, because Docker Desktop on macOS/Windows can't see USB devices from
+> inside containers. Start one relay per controller (each on its own port) in separate terminals first.
 
 ```bash
-# Start relay on host first
+# Start relay on host first (separate terminal, NOT inside Docker)
 uv run bin/hid_relay.py --port 9090
 
 # Then start container (SSROV)
-docker compose -f docker-compose.hc.yml --profile relay up
+docker compose -f docker-compose.hc.yml --profile ssrov up
 
 # Logitech
-docker compose -f docker-compose.hc.yml --profile logitech-relay up
+docker compose -f docker-compose.hc.yml --profile logitech up
 
 # Both controllers
-docker compose -f docker-compose.hc.yml --profile relay --profile logitech-relay up
+docker compose -f docker-compose.hc.yml --profile ssrov --profile logitech up
 ```
 
 ### Build Image
@@ -256,15 +304,17 @@ uv run bin/hid_relay.py --button-map '{"0":2}'
 
 ### Install Dependencies
 
+Dependencies are declared in [pyproject.toml](pyproject.toml) with optional groups.
+
 ```bash
-# Container dependencies (installed automatically by Docker)
-uv pip install --system -r requirements.txt
+# Container/runtime dependencies (installed automatically by Docker)
+uv pip install --system .
 
 # Host relay dependencies (only needed for macOS/Windows relay mode)
-uv pip install --system -r requirements_relay.txt
+uv pip install --system ".[relay]"
 
-# Development dependencies
-uv pip install --system -r requirements_dev.txt
+# Development dependencies (black, pylint, pytest)
+uv pip install --system ".[dev]"
 ```
 
 ---
@@ -276,18 +326,20 @@ uv pip install --system -r requirements_dev.txt
 ```
 keelson-connector-hand-controller/
 ├── bin/
-│   ├── hc2keelson       # Main connector script
+│   ├── hc2keelson            # Main connector script
 │   ├── hid_relay.py          # Cross-platform host-side relay
+│   ├── joystick_proto.py     # Shared HID protocol constants + parsing
 │   └── terminal_inputs.py    # Argument parsing
+├── profiles/
+│   ├── ssrov.yaml            # Seascape ROV Hand Controller profile
+│   └── logitech.yaml         # Logitech F310/F710 profile
+├── tests/                    # pytest suite
 ├── examples/
-│   ├── joystick_reader.py    # Standalone joystick reader
-│   └── serial_pyserial_reader.py  # Legacy serial reader
+│   └── joystick_reader.py    # Standalone joystick reader
 ├── doc/                      # Datasheets and documentation
 ├── docker-compose.hc.yml
 ├── Dockerfile
-├── requirements.txt          # Runtime dependencies
-├── requirements_dev.txt      # Dev tools (black, pylint)
-├── requirements_relay.txt    # Host relay dependencies (pygame)
+├── pyproject.toml            # Dependencies (runtime, [dev], [relay] extras)
 └── README.md
 ```
 
@@ -362,13 +414,63 @@ sudo usermod -a -G input $USER
 2. Test with `python3 examples/joystick_reader.py` (Linux) or `uv run bin/hid_relay.py --list` (any OS)
 3. Move joysticks and press buttons
 4. Check kernel module: `lsmod | grep joydev` (Linux)
-5. Enable debug logging: `--log-level 10`
+5. Enable debug logging — see below
+
+### Joystick / D-pad Look Dead in Docker Logs (but buttons work)
+
+**Symptom:** `docker compose -f docker-compose.hc.yml up` shows button press/release lines when
+you press buttons, but moving the sticks or D-pad shows nothing — so it looks like axes and
+D-pad aren't being recognized.
+
+**Cause:** Logging is intentionally asymmetric to keep the log readable:
+
+| Event | Log level | Visible at default INFO? |
+| ----- | --------- | ------------------------ |
+| Button press/release | `INFO` | yes |
+| Joystick axis motion | `DEBUG` | no |
+| D-pad (encoded as two axis events by the relay) | `DEBUG` | no |
+
+Axes and D-pad still publish to Keelson normally — they just don't log at the default
+`--log-level 20` (INFO).
+
+**Verify they're being received** by switching the container to DEBUG. Edit the relevant
+service's `command:` line in [docker-compose.hc.yml](docker-compose.hc.yml) and change
+`--log-level 20` to `--log-level 10`:
+
+```yaml
+command: ["hc2keelson --log-level 10 -r rise -e ssrs18 --controller ssrov --relay host.docker.internal:9090"]
+```
+
+Restart the stack and you should now see lines like:
+
+```text
+Axis 0 (joystick_x_pct): 12345 -> 37.681
+Ignoring unmapped axis 6: 32767
+```
+
+For D-pad confirmation on the **host-side relay** (separate process, separate log), look for:
+
+```text
+Hat (1,0) -> dpad_x=32767, dpad_y=0
+```
+
+> ⚠️ DEBUG produces a lot of output while sticks are moving — switch back to `--log-level 20`
+> for normal operation.
 
 ### Relay Connection Issues (macOS/Windows)
 
-1. Ensure `hid_relay.py` is running on the host before starting the container
-2. Check that the relay port (default 9090) is not blocked by a firewall
-3. The container uses `host.docker.internal` to reach the host - this works automatically on Docker Desktop
+**Symptom:** container logs show `Cannot connect to relay: [Errno 111] Connection refused` on a retry loop.
+
+**Cause:** nothing is listening on the relay port on the host. The relay runs on the **host**, not in Docker —
+it cannot be started by `docker compose up`. Containers on macOS/Windows have no access to host USB devices,
+which is exactly why the relay exists as a separate host-side process.
+
+**Fix:**
+
+1. Start `hid_relay.py` on the host (one terminal per controller, separate ports) **before** `docker compose up`
+2. Verify it's listening: `lsof -nP -iTCP:9090 -sTCP:LISTEN` (should show a python process)
+3. Check that the relay port is not blocked by a firewall
+4. The container uses `host.docker.internal` to reach the host — this works automatically on Docker Desktop
 
 ---
 
