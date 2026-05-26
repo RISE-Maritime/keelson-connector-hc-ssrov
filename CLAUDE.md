@@ -41,7 +41,7 @@ uv run bin/hid_relay.py --port 9090
 uv run bin/hid_relay.py --no-mfi --port 9091 --joystick-index 0
 
 # 3. Start the containers:
-docker compose -f docker-compose.hc.yml --profile relay --profile logitech-relay up
+docker compose -f docker-compose.hc.yml --profile ssrov --profile logitech up
 
 # List available joysticks on host:
 uv run bin/hid_relay.py --list              # shows SSROV
@@ -76,9 +76,9 @@ Unmapped buttons publish to `button_state_change` with the button number as the 
 
 ### Keelson Key Expression Pattern
 ```
-{realm}/@v0/{entity_id}/pubsub/{subject}/controller/{hw}/{function}
-# e.g.: rise/@v0/rov/pubsub/joystick_x/controller/ssrov/joystick_x
-# e.g.: rise/@v0/rov/pubsub/button_state_change/controller/ssrov/arm
+{realm}/@v0/{entity_id}/pubsub/{subject}/<controller_id>/<input_name>
+# e.g.: rise/@v0/rov/pubsub/joystick_x_pct/ssrov/joystick_x_pct
+# e.g.: rise/@v0/rov/pubsub/button_state_change/ssrov/arm
 ```
 
 ### Cross-Platform Relay Architecture
@@ -101,20 +101,17 @@ Unmapped buttons publish to `button_state_change` with the button number as the 
 
 ## Dependencies
 
-- `keelson==0.4.4` — Keelson protocol (Zenoh + protobuf)
+- `keelson==0.5.1` — Keelson protocol (Zenoh + protobuf)
 - `skarv==0.3.0` — in-memory data vault
-- `environs==14.5.0` — env var management
+- `environs==15.0.1` — env var management
 - Dev: `black==25.9.0`, `pylint==4.0.2`
 - Host relay: `pygame>=2.5.0` (see `requirements_relay.txt`, only needed on host for cross-platform mode)
 
 ## Docker
 
-Base image: `python:3.13-slim-bookworm` with tini for signal handling. The compose file includes four service profiles:
+Base image: `python:3.13-slim-bookworm` with tini for signal handling. The compose file defines two profiles:
 
-- **default** (`hc-to-keelson`): Linux direct mode, mounts `/dev/input/js0` with `privileged: true`
-- **`client`**: Linux direct + client Zenoh connection
-- **`relay`**: Cross-platform relay mode, connects to host-side `hid_relay.py` via TCP
-- **`relay-client`**: Relay mode + client Zenoh connection
-- **`logitech-relay`**: Logitech F310/F710 relay mode
+- **`ssrov`** (`keelson-connector-ssrov`): Cross-platform relay mode for the Seascape controller, connects to host-side `hid_relay.py` on port 9090
+- **`logitech`** (`keelson-connector-logitech`): Cross-platform relay mode for Logitech F310/F710, connects to host-side `hid_relay.py` on port 9091
 
-All services use `network_mode: host`. Relay services include `extra_hosts` for `host.docker.internal` compatibility on Linux Docker Engine.
+Both services use `network_mode: host` and include `extra_hosts` for `host.docker.internal` compatibility on Linux Docker Engine.

@@ -1,3 +1,0 @@
-environs==14.5.0
-keelson==0.4.4
-skarv==0.3.0

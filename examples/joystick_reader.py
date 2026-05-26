@@ -25,16 +25,19 @@ Usage:
 """
 
 import argparse
-import struct
 import sys
 from pathlib import Path
 from datetime import datetime
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "bin"))
 
-# Joystick event types (from linux/joystick.h)
-JS_EVENT_BUTTON = 0x01  # Button pressed/released
-JS_EVENT_AXIS = 0x02    # Joystick moved
-JS_EVENT_INIT = 0x80    # Initial state (ignore this flag)
+from joystick_proto import (  # noqa: E402  (sys.path shim must come first)
+    JS_EVENT_AXIS,
+    JS_EVENT_BUTTON,
+    JS_EVENT_INIT,
+    normalize_axis,
+    read_event,
+)
 
 # Default device
 DEFAULT_DEVICE = "/dev/input/js0"
@@ -72,32 +75,6 @@ def list_joystick_devices():
             pass
         
         print()
-
-
-def read_joystick_event(device_file):
-    """
-    Read a single joystick event from the device.
-    
-    Event format (8 bytes total):
-        - timestamp: 4 bytes (unsigned int) - milliseconds since device opened
-        - value: 2 bytes (signed short) - button: 0/1, axis: -32768 to 32767
-        - type: 1 byte (unsigned char) - JS_EVENT_BUTTON or JS_EVENT_AXIS
-        - number: 1 byte (unsigned char) - button/axis number
-    
-    Returns:
-        tuple: (timestamp, value, event_type, number) or None if error
-    """
-    try:
-        event_data = device_file.read(8)
-        if len(event_data) < 8:
-            return None
-        
-        # Unpack event: I=uint32, h=int16, B=uint8, B=uint8
-        timestamp, value, event_type, number = struct.unpack('IhBB', event_data)
-        return (timestamp, value, event_type, number)
-    except Exception as e:
-        print(f"Error reading event: {e}")
-        return None
 
 
 def main():
@@ -177,7 +154,7 @@ def main():
         
         # Read events loop
         while True:
-            event = read_joystick_event(js_device)
+            event = read_event(js_device)
             
             if event:
                 timestamp, value, event_type, number = event
@@ -204,7 +181,7 @@ def main():
                     init_flag = " [INIT]" if is_init else ""
                     
                     # Show percentage for better readability
-                    percentage = (value / 32767) * 100
+                    percentage = normalize_axis(value)
                     bar_length = 40
                     bar_fill = int((value + 32768) / 65535 * bar_length)
                     bar = "=" * bar_fill + " " * (bar_length - bar_fill)
@@ -238,7 +215,7 @@ def main():
             print("\nFinal axis values:")
             for axis in sorted(axis_values.keys()):
                 value = axis_values[axis]
-                print(f"  Axis {axis:2d}: {value:6d} ({value/32767*100:6.1f}%)")
+                print(f"  Axis {axis:2d}: {value:6d} ({normalize_axis(value):6.1f}%)")
         
     except Exception as e:
         print(f"\nError: {e}")

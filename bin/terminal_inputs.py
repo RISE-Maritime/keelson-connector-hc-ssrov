@@ -72,8 +72,76 @@ def terminal_inputs():
         "--controller",
         type=str,
         default="ssrov",
-        choices=["ssrov", "logitech"],
-        help="Controller profile for axis/button mapping",
+        help="Controller profile name (resolves to profiles/<name>.yaml).",
+    )
+
+    parser.add_argument(
+        "--controller-config",
+        type=str,
+        default=None,
+        help="Path to a custom controller-profile YAML file. Overrides --controller.",
+    )
+
+    parser.add_argument(
+        "--relay-max-retries",
+        type=int,
+        default=0,
+        help="Max relay connection attempts before exit (0 = unlimited).",
+    )
+
+    parser.add_argument(
+        "--axis-min-interval-ms",
+        type=int,
+        default=30,
+        help="Per-axis rate limit: minimum ms between publishes when value barely changed.",
+    )
+
+    parser.add_argument(
+        "--axis-min-change",
+        type=float,
+        default=1.0,
+        help="Per-axis rate limit: percentage-point change that forces immediate publish.",
+    )
+
+    parser.add_argument(
+        "--axis-center-snap-pct",
+        type=float,
+        default=0.0,
+        help=(
+            "Snap |value| < this to 0.0 before the rate-limit check. "
+            "Cleans up joystick ADC rest offset so a released stick publishes exactly 0.0. "
+            "0 disables; recommended 2.0. Loses sub-snap precision near rest."
+        ),
+    )
+
+    parser.add_argument(
+        "--log-json",
+        action="store_true",
+        help="Emit logs as one JSON object per line (for container log pipelines).",
+    )
+
+    parser.add_argument(
+        "--source-id",
+        type=str,
+        default=None,
+        help="Override the source-id base. Defaults to the --controller value. "
+        "Use this to run two of the same controller side-by-side with distinct "
+        "source-id prefixes (e.g. --controller ssrov --source-id ssrov-port).",
+    )
+
+    parser.add_argument(
+        "--health-interval-s",
+        type=float,
+        default=1.0,
+        help="Period (seconds) between controller_health publishes.",
+    )
+
+    parser.add_argument(
+        "--health-stale-s",
+        type=float,
+        default=2.0,
+        help="If no hardware event has arrived within this many seconds, "
+        "controller_health is published as 0 (stale); otherwise 1 (alive).",
     )
 
     # Parse arguments and start doing our thing

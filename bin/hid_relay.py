@@ -30,7 +30,6 @@ import signal
 import socket
 import struct
 import sys
-import threading
 import time
 
 try:
@@ -163,6 +162,13 @@ def run_relay(
                     logger.debug(f"Button {event.button}->{btn_num} released")
                     events_to_send.append(pack_event(JS_EVENT_BUTTON, btn_num, 0))
 
+                elif event.type == pygame.JOYDEVICEREMOVED:
+                    logger.error(
+                        f"Joystick removed (instance_id={event.instance_id}); "
+                        "exiting non-zero so a supervisor can restart the relay."
+                    )
+                    sys.exit(2)
+
                 elif event.type == pygame.JOYHATMOTION:
                     # Convert hat (x, y) to two axis events
                     # dpad_axis_base = dpad_x, dpad_axis_base+1 = dpad_y
@@ -290,16 +296,21 @@ def main():
         # macOS IOKit reports axes in same order as Linux (0,1=left, 2,3=right).
         # No axis remap needed. Hat (dpad) maps to wire axes 4,5.
         dpad_axis_base = 4
-        logger.info(
-            "Auto-applying --no-mfi settings: dpad_axis_base=4, no axis remap"
-        )
+        logger.info("Auto-applying --no-mfi settings: dpad_axis_base=4, no axis remap")
 
     if axis_map:
         logger.info(f"Axis remapping: {axis_map}")
     if button_map:
         logger.info(f"Button remapping: {button_map}")
 
-    run_relay(args.port, args.joystick_index, axis_map, button_map, args.no_mfi, dpad_axis_base)
+    run_relay(
+        args.port,
+        args.joystick_index,
+        axis_map,
+        button_map,
+        args.no_mfi,
+        dpad_axis_base,
+    )
 
 
 if __name__ == "__main__":
